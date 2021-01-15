@@ -1,5 +1,4 @@
 #![allow(unused_imports, unused_variables)]
-use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::{
     self,
@@ -11,7 +10,9 @@ use std::{
     *,
 };
 use std::{convert::TryInto, io};
+use std::{fs::OpenOptions, io::prelude::*};
 
+use bucket::descriptor::BucketDescription;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use fs2::*;
@@ -26,14 +27,14 @@ use descriptor::DBDescriptor;
 /// Extension used for buckets
 static EXTENSION: &'static str = ".page";
 
-pub struct Database<'a> {
-    store_dir: &'a Path,                            // Directory to store buckets
+pub struct Database<'a, 'b> {
+    store_dir: &'b Path,                            // Directory to store buckets
     buckets: BTreeMap<&'a str, Arc<Mutex<Bucket>>>, // BTree of in-use buckets
     descriptor: Option<DBDescriptor>,
 }
 
-impl<'a> Database<'a> {
-    pub fn open(path: &'a str) -> Result<Database<'a>, Box<dyn std::error::Error>> {
+impl<'a, 'b> Database<'a, 'b> {
+    pub fn open(path: &'b str) -> Result<Database<'a, 'b>, Box<dyn std::error::Error>> {
         // Initialize database struct
         let mut db = Database {
             store_dir: &Path::new(path),
@@ -41,21 +42,28 @@ impl<'a> Database<'a> {
             descriptor: None,
         };
 
+        println!("Opening database");
+
         // Create the database directory if it doesn't exist
         if !db.store_dir.is_dir() {
             db.create_head_dir()?;
+            println!("Created head directory");
 
             // Create descriptor file and write to it
             let dynamic = DBDescriptor::dynamic();
             dynamic.save_to_path(&db.store_dir.join(&Path::new("database.desc")))?;
+            println!("Saved to path");
 
             // Assign descriptor
             db.descriptor = Some(dynamic);
         } else {
+            println!("Loading from path");
             db.descriptor = Some(DBDescriptor::load_from_path(
                 &db.store_dir.join(&Path::new("database.desc")),
             )?);
         }
+
+        println!("Finished loading database");
 
         Ok(db)
     }
@@ -65,37 +73,51 @@ impl<'a> Database<'a> {
         Ok(fs::create_dir(self.store_dir)?)
     }
 
-    pub fn open_bucket(&mut self, name: &'a str) -> std::io::Result<()> {
+    pub fn open_bucket(
+        &mut self,
+        name: &'a str,
+        descriptor: Option<BucketDescription>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Try to load an already existing bucket
-        let res = self.load_bucket(&name);
+        let res = self.load_bucket(&name, descriptor.clone());
         match res {
             Ok(b) => {
                 // Load an existing bucket if it exists
                 self.buckets.insert(name, b);
             }
-            Err(_) => {
+            Err(e) => {
                 // Create a new bucket if it doesn't exist
                 let p = self
                     .store_dir
                     .join(Path::new(&(name.to_owned() + EXTENSION)));
                 let pager = File::create(&p)?;
-                self.buckets.insert(name, Bucket::new(pager, p, true)?);
+                let pager = OpenOptions::new().read(true).write(true).open(&p)?;
+                self.buckets
+                    .insert(name, Bucket::new(pager, p, true, descriptor)?);
             }
         }
 
         Ok(())
     }
 
-    fn load_bucket(&self, name: &str) -> std::io::Result<Arc<Mutex<Bucket>>> {
+    fn load_bucket(
+        &self,
+        name: &str,
+        descriptor: Option<BucketDescription>,
+    ) -> Result<Arc<Mutex<Bucket>>, Box<dyn std::error::Error>> {
         // Check if the bucket exists
         let p = self
             .store_dir
             .join(Path::new(&(name.to_owned() + EXTENSION)));
         if !p.exists() {
-            return Err(Error::new(ErrorKind::NotFound, "bucket was not found"));
+            return Err(Box::new(Error::new(
+                ErrorKind::NotFound,
+                "bucket was not found",
+            )));
         }
 
-        Ok(Bucket::new(File::open(&p)?, p, false)?)
+        let file = OpenOptions::new().read(true).write(true).open(&p)?;
+        Ok(Bucket::new(file, p, false, descriptor)?)
     }
 
     /// Inserts a new key and value into a bucket
@@ -104,11 +126,16 @@ impl<'a> Database<'a> {
         bucket: &str,
         key: isize,
         value: T,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let bucket = self.buckets.get_mut(bucket);
         let bucket = match bucket {
             Some(b) => b,
-            None => return Err(Error::new(ErrorKind::NotFound, "bucket was not found")),
+            None => {
+                return Err(Box::new(Error::new(
+                    ErrorKind::NotFound,
+                    "bucket was not found",
+                )))
+            }
         };
 
         // Get a document from the value
@@ -116,14 +143,35 @@ impl<'a> Database<'a> {
         let document = match document {
             Some(d) => d,
             None => {
-                return Err(std::io::Error::new(
+                return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "failed to convert to document",
-                ))
+                )))
             }
         };
 
-        let x = T::convert_from(&document);
+        // Todo: Fix, solution is very slow (maybe a hashmap?)
+        // Todo: (maybe generics to match it? Might not be able to in current rust versions)
+        {
+            let mut buck = bucket.lock().unwrap();
+            for f in document.get_fields().iter() {
+                let mut found_f = false;
+                for is_f in buck.descriptor.as_ref().unwrap().field_description.iter() {
+                    if is_f.is_match(f) {
+                        found_f = true;
+                    }
+                }
+
+                if !found_f {
+                    return Err(Box::new(Error::new(
+                        ErrorKind::NotFound,
+                        "field does not exist",
+                    )));
+                }
+            }
+
+            buck.insert(&document)?;
+        }
 
         Ok(())
     }

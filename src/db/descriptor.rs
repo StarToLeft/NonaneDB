@@ -1,4 +1,10 @@
-use std::{convert::TryInto, error::Error, fs::File, io::{Read, Seek, SeekFrom, Write}, path::Path};
+use std::{
+    convert::TryInto,
+    error::Error,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fs2::FileExt;
@@ -49,19 +55,17 @@ impl DBDescriptor {
 
     pub fn load_from_path(path: &Path) -> Result<DBDescriptor, Box<dyn Error>> {
         // Open descriptor file
-        let mut file = File::open(path)?;
+        let mut file = OpenOptions::new().read(true).read(true).write(true).open(&path)?;
 
         // Seek and read description length
         file.seek(SeekFrom::Start(0))?;
-        let length = file.read_u64::<LittleEndian>()?.try_into().unwrap();
+        let length = file.read_u64::<LittleEndian>()?.try_into()?;
 
         // Initialize buffer for reading
         let mut buf: Vec<u8> = Vec::with_capacity(length);
         unsafe { buf.set_len(length) };
 
-        file.seek(SeekFrom::Current(
-            std::mem::size_of::<u64>().try_into().unwrap(),
-        ))?;
+        file.seek(SeekFrom::Current(std::mem::size_of::<u64>().try_into()?))?;
         file.read_exact(&mut buf)?;
 
         let descriptor = DBDescriptor::deserialize(&buf)?;
@@ -69,7 +73,7 @@ impl DBDescriptor {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let mut file = File::create(path)?;
+        let mut file = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
 
         // Serialize the descriptor and write it
         let buf = self.serialize();

@@ -1,6 +1,7 @@
 use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum FieldType {
     Uuid = 0x0,
     Bytes = 0x1,
@@ -17,6 +18,7 @@ pub enum FieldType {
     Float64 = 0xC,
 }
 
+/// Implemented on data types to convert them to bytes
 pub trait ConvertFieldType<'a, T> {
     type Output;
 

@@ -1,29 +1,48 @@
+#![allow(non_snake_case)]
 #[macro_use]
 extern crate serde;
 
 pub mod db;
+pub mod utils;
 
 use db::{
-    bucket::document::{field::Field, Document, DocumentConvert},
+    bucket::{
+        descriptor::BucketDescription,
+        document::{
+            field::{descriptor::FieldDescriptor, fieldtype::FieldType, Field},
+            Document, DocumentConvert,
+        },
+    },
     Database,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting test");
     let t = std::time::Instant::now();
     let mut db: Database = Database::open("./database")?;
     let el = t.elapsed();
     println!("Open database {:?}", el);
 
     let t = std::time::Instant::now();
-    db.open_bucket("accounts")?;
+    let desc = BucketDescription {
+        field_description: vec![
+            FieldDescriptor::new("first_name".into(), FieldType::Text),
+            FieldDescriptor::new("last_name".into(), FieldType::Text),
+            FieldDescriptor::new("email".into(), FieldType::Text),
+        ],
+    };
+    db.open_bucket("accounts", Some(desc))?;
     let el = t.elapsed();
     println!("Open bucket {:?}", el);
 
+    let t = std::time::Instant::now();
     db.insert::<Account>(
         "accounts",
         0,
         Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se"),
     )?;
+    let el = t.elapsed();
+    println!("Insert into bucket {:?}", el);
 
     Ok(())
 }
@@ -32,19 +51,14 @@ pub struct Account {
     first_name: String,
     last_name: String,
     email: String,
-    data: Vec<u8>,
 }
 
 impl Account {
     pub fn new(first_name: &str, last_name: &str, email: &str) -> Account {
-        let mut data: Vec<u8> = Vec::with_capacity(1_048_576);
-        unsafe { data.set_len(1_048_576) };
-
         Account {
             first_name: first_name.to_string(),
             last_name: last_name.to_string(),
             email: email.to_string(),
-            data,
         }
     }
 }
@@ -57,9 +71,7 @@ impl DocumentConvert for Account {
         let last_name = Field::new("last_name", self.last_name.to_string())?;
         let email = Field::new("email", self.email.to_string())?;
 
-        let data = Field::new("data", &self.data)?;
-
-        Some(Document::new(vec![first_name, last_name, email, data]))
+        Some(Document::new(vec![first_name, last_name, email]))
     }
 
     fn convert_from(doc: &Document) -> Option<Self::ConvertFrom> {
