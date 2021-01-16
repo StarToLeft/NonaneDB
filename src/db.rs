@@ -29,7 +29,7 @@ static EXTENSION: &'static str = ".page";
 
 pub struct Database<'a, 'b> {
     store_dir: &'b Path,                            // Directory to store buckets
-    buckets: BTreeMap<&'a str, Arc<Mutex<Bucket>>>, // BTree of in-use buckets
+    buckets: BTreeMap<&'a str, Bucket>, // BTree of in-use buckets
     descriptor: Option<DBDescriptor>,
 }
 
@@ -104,7 +104,7 @@ impl<'a, 'b> Database<'a, 'b> {
         &self,
         name: &str,
         descriptor: Option<BucketDescription>,
-    ) -> Result<Arc<Mutex<Bucket>>, Box<dyn std::error::Error>> {
+    ) -> Result<Bucket, Box<dyn std::error::Error>> {
         // Check if the bucket exists
         let p = self
             .store_dir
@@ -150,13 +150,14 @@ impl<'a, 'b> Database<'a, 'b> {
             }
         };
 
+        // Current solution loops through all fields, won't be very effiecent with a big amount of fields
         // Todo: Fix, solution is very slow (maybe a hashmap?)
         // Todo: (maybe generics to match it? Might not be able to in current rust versions)
         {
-            let mut buck = bucket.lock().unwrap();
             for f in document.get_fields().iter() {
                 let mut found_f = false;
-                for is_f in buck.descriptor.as_ref().unwrap().field_description.iter() {
+                let p = bucket.descriptor.as_ref().unwrap().pull();
+                for is_f in p.as_ref().field_description.iter() {
                     if is_f.is_match(f) {
                         found_f = true;
                     }
@@ -170,7 +171,7 @@ impl<'a, 'b> Database<'a, 'b> {
                 }
             }
 
-            buck.insert(&document)?;
+            bucket.insert(&document)?;
         }
 
         Ok(())

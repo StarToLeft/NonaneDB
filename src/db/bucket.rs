@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 
 use descriptor::BucketDescription;
 
-use crate::utils;
+use crate::utils::{self, pool::Pool};
 
 use self::document::Document;
 
 pub mod descriptor;
 pub mod document;
+pub mod reader;
+pub mod writer;
 
 /// A minimum set of space required to initialize a bucket
 ///
@@ -29,7 +31,7 @@ static MIN_FREE_BYTES: u64 = 1_048_576; // A minimum of 1 MB of free space
 pub struct Bucket {
     pub(crate) file: File,
     pub(crate) path: PathBuf,
-    pub(crate) descriptor: Option<BucketDescription>,
+    pub(crate) descriptor: Option<Pool<BucketDescription>>,
 }
 
 impl Bucket {
@@ -39,7 +41,7 @@ impl Bucket {
         path: PathBuf,
         should_init: bool,
         descriptor: Option<BucketDescription>,
-    ) -> Result<Arc<Mutex<Bucket>>, Box<dyn std::error::Error>> {
+    ) -> Result<Bucket, Box<dyn std::error::Error>> {
         let mut bucket = Self {
             file,
             path,
@@ -52,7 +54,7 @@ impl Bucket {
             bucket.load_page()?;
         }
 
-        Ok(Arc::new(Mutex::new(bucket)))
+        Ok(bucket)
     }
 
     pub fn initialize(
@@ -69,12 +71,13 @@ impl Bucket {
         }
 
         // Check if the descriptor is defined
-        self.descriptor = descriptor;
-        if self.descriptor.is_none() {
+        if descriptor.is_none() {
             panic!(
                 "Couldn't initialize bucket due to descriptor not defined {}",
                 self.path.file_name().unwrap().to_str().unwrap()
             );
+        } else {
+            self.descriptor = Some(Pool::new(num_cpus::get(), || descriptor.clone().unwrap()));
         }
 
         // Initialize the page and write it to disk
@@ -94,16 +97,24 @@ impl Bucket {
         self.file.seek(SeekFrom::Start(0))?;
 
         // Writes the descriptor to disk (WARN: Takes up a whol page)
-        let desc = self.descriptor.as_ref().unwrap();
-        let mut d = bincode::serialize(desc)?;
-        let len = page_size::get() - d.len();
-        let mut append = Vec::with_capacity(len);
-        unsafe { append.set_len(len) };
-        d.append(&mut append);
-        let d = d.as_slice();
+        let buf;
+        {
+            let p = self.descriptor.as_ref().unwrap().pull();
+            let r = p.as_ref();
+            let mut d = bincode::serialize(r)?;
+
+            let len = page_size::get() - d.len();
+            let mut append = Vec::with_capacity(len);
+            unsafe { append.set_len(len) };
+            d.append(&mut append);
+
+            buf = d;
+        }
+
+        let buf = buf.as_slice();
         self.file
-            .write_u16::<LittleEndian>(d.len().try_into().unwrap())?;
-        self.file.write(d)?;
+            .write_u16::<LittleEndian>(buf.len().try_into().unwrap())?;
+        self.file.write(buf)?;
         self.set_offset(page_size::get().try_into().unwrap())?;
 
         Ok(())
@@ -118,7 +129,9 @@ impl Bucket {
         unsafe { buf.set_len(len.into()) };
         self.file.read(&mut buf)?;
 
-        self.descriptor = Some(bincode::deserialize::<BucketDescription>(buf.as_slice())?);
+        self.descriptor = Some(Pool::new(num_cpus::get(), || {
+            bincode::deserialize::<BucketDescription>(buf.as_slice()).unwrap()
+        }));
         Ok(())
     }
 
@@ -149,7 +162,7 @@ impl Bucket {
 
         // Serialize document
         let mut buf = document.serialize()?;
-        let len = utils::numbers::round_to_multiple(buf.len(), 256);
+        let len = utils::numbers::round_to_multiple(buf.len(), 8);
         buf.resize(len, 0);
         let slice = buf.as_slice();
 
@@ -171,3 +184,6 @@ impl Bucket {
 
     pub fn insert_into_index() {}
 }
+
+unsafe impl Send for Bucket {}
+unsafe impl Sync for Bucket {}
