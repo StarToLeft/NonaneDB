@@ -10,6 +10,7 @@ use std::{
     thread::{self, JoinHandle, Thread},
 };
 
+use crossbeam_queue::ArrayQueue;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fs2::*;
 use parking_lot::Mutex;
@@ -20,13 +21,7 @@ use descriptor::BucketDescription;
 
 use crate::utils::{self, pool::Pool};
 
-use self::{
-    document::Document,
-    writer::{
-        queued::{QueuedWriter, WriterThread},
-        Writer,
-    },
-};
+use self::{document::Document, writer::{Writer, queued::{QueuedWriteInformation, QueuedWriter, WriterThread}}};
 
 pub mod descriptor;
 pub mod document;
@@ -60,22 +55,31 @@ impl<'a> Bucket<'a> {
         descriptor: Option<BucketDescription>,
     ) -> Result<Bucket<'a>, Box<dyn std::error::Error>> {
         let will_write = Arc::new(AtomicBool::new(false));
+        
+        // Initialize multi-readers
         let readers = Pool::new(num_cpus::get(), || {
             Reader::new(name, &path.clone(), will_write.clone())
                 .expect("Failed to initialize reader for pool")
         });
+
+        // Initialize single writer
+        // Todo: Add QueuedWriter for multi-threaded writing
+        // Todo: Will optimize by combining bytes to be written into a big insert instead of a lot of small ones
         let writer = Arc::new(Mutex::new(
             Writer::new(name, &path.clone(), will_write.clone())
                 .expect("Failed to initialize writer for bucket"),
         ));
 
+        // Initialize write queue
+        let q: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(1000);
         let thread = thread::Builder::new()
             .name(name.into())
             .spawn(|| {
-                QueuedWriter::new()
+                QueuedWriter::new(q)
             })
             .unwrap();
 
+        // Create bucket
         let mut bucket = Self {
             name: Arc::new(name),
             path: Arc::new(path.clone()),

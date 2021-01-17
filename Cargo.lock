@@ -7,6 +7,7 @@ dependencies = [
  "bincode",
  "byteorder",
  "crossbeam-channel",
+ "crossbeam-queue",
  "env_logger",
  "fs2",
  "libc",
@@ -132,6 +133,16 @@ dependencies = [
  "lazy_static",
  "memoffset",
  "scopeguard",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f6cb3c7f5b8e51bc3ebb73a2327ad4abdbd119dc13223f14f961d2f38486756"
+dependencies = [
+ "cfg-if 1.0.0",
+ "crossbeam-utils",
 ]
 
 [[package]]
