@@ -28,8 +28,8 @@ use descriptor::DBDescriptor;
 static EXTENSION: &'static str = ".page";
 
 pub struct Database<'a, 'b> {
-    store_dir: &'b Path,                            // Directory to store buckets
-    buckets: BTreeMap<&'a str, Bucket>, // BTree of in-use buckets
+    store_dir: &'b Path,                // Directory to store buckets
+    buckets: BTreeMap<&'a str, Bucket<'a>>, // BTree of in-use buckets
     descriptor: Option<DBDescriptor>,
 }
 
@@ -68,8 +68,8 @@ impl<'a, 'b> Database<'a, 'b> {
         Ok(db)
     }
 
+    /// Creates directory to hold buckets and database information
     pub fn create_head_dir(&self) -> std::io::Result<()> {
-        // Create directory to hold buckets and database information
         Ok(fs::create_dir(self.store_dir)?)
     }
 
@@ -79,7 +79,7 @@ impl<'a, 'b> Database<'a, 'b> {
         descriptor: Option<BucketDescription>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Try to load an already existing bucket
-        let res = self.load_bucket(&name, descriptor.clone());
+        let res = self.load_bucket(name.clone(), descriptor.clone());
         match res {
             Ok(b) => {
                 // Load an existing bucket if it exists
@@ -93,7 +93,7 @@ impl<'a, 'b> Database<'a, 'b> {
                 let pager = File::create(&p)?;
                 let pager = OpenOptions::new().read(true).write(true).open(&p)?;
                 self.buckets
-                    .insert(name, Bucket::new(pager, p, true, descriptor)?);
+                    .insert(name, Bucket::new(name, pager, p, true, descriptor)?);
             }
         }
 
@@ -102,9 +102,9 @@ impl<'a, 'b> Database<'a, 'b> {
 
     fn load_bucket(
         &self,
-        name: &str,
+        name: &'a str,
         descriptor: Option<BucketDescription>,
-    ) -> Result<Bucket, Box<dyn std::error::Error>> {
+    ) -> Result<Bucket<'a>, Box<dyn std::error::Error>> {
         // Check if the bucket exists
         let p = self
             .store_dir
@@ -117,7 +117,7 @@ impl<'a, 'b> Database<'a, 'b> {
         }
 
         let file = OpenOptions::new().read(true).write(true).open(&p)?;
-        Ok(Bucket::new(file, p, false, descriptor)?)
+        Ok(Bucket::new(name, file, p, false, descriptor)?)
     }
 
     /// Inserts a new key and value into a bucket
@@ -153,26 +153,24 @@ impl<'a, 'b> Database<'a, 'b> {
         // Current solution loops through all fields, won't be very effiecent with a big amount of fields
         // Todo: Fix, solution is very slow (maybe a hashmap?)
         // Todo: (maybe generics to match it? Might not be able to in current rust versions)
-        {
-            for f in document.get_fields().iter() {
-                let mut found_f = false;
-                let p = bucket.descriptor.as_ref().unwrap().pull();
-                for is_f in p.as_ref().field_description.iter() {
-                    if is_f.is_match(f) {
-                        found_f = true;
-                    }
-                }
-
-                if !found_f {
-                    return Err(Box::new(Error::new(
-                        ErrorKind::NotFound,
-                        "field does not exist",
-                    )));
+        for f in document.get_fields().iter() {
+            let mut found_f = false;
+            let p = bucket.descriptor.as_ref().unwrap().pull();
+            for is_f in p.as_ref().field_description.iter() {
+                if is_f.is_match(f) {
+                    found_f = true;
                 }
             }
 
-            bucket.insert(&document)?;
+            if !found_f {
+                return Err(Box::new(Error::new(
+                    ErrorKind::NotFound,
+                    "field does not exist",
+                )));
+            }
         }
+
+        bucket.insert(&document)?;
 
         Ok(())
     }

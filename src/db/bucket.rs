@@ -1,20 +1,16 @@
-use std::{
-    convert::TryInto,
-    fs::File,
-    io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{convert::TryInto, fs::File, io::{Error, ErrorKind, Read, Seek, SeekFrom, Write}, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fs2::*;
+use parking_lot::Mutex;
+use reader::Reader;
 use serde::{Deserialize, Serialize};
 
 use descriptor::BucketDescription;
 
 use crate::utils::{self, pool::Pool};
 
-use self::document::Document;
+use self::{document::Document, writer::Writer};
 
 pub mod descriptor;
 pub mod document;
@@ -28,26 +24,37 @@ pub mod writer;
 static MIN_FREE_BYTES: u64 = 1_048_576; // A minimum of 1 MB of free space
 
 /// A bucket defines a datastructure, it contains a whole database within it
-pub struct Bucket {
+pub struct Bucket<'a> {
+    pub(crate) name: &'a str,
     pub(crate) file: File,
     pub(crate) path: PathBuf,
     pub(crate) descriptor: Option<Pool<BucketDescription>>,
+    pub(crate) will_write: Arc<AtomicBool>,
+    pub(crate) readers: Pool<Reader<'a>>,
+    pub(crate) writer: Arc<Mutex<Writer<'a>>>,
 }
 
-impl Bucket {
+impl<'a> Bucket<'a> {
     /// Creates a new bucket and initializes it with it's required data structure
     pub fn new(
+        name: &'a str,
         file: File,
         path: PathBuf,
         should_init: bool,
         descriptor: Option<BucketDescription>,
-    ) -> Result<Bucket, Box<dyn std::error::Error>> {
+    ) -> Result<Bucket<'a>, Box<dyn std::error::Error>> {
+        let will_write = Arc::new(AtomicBool::new(false));
         let mut bucket = Self {
+            name,
             file,
             path,
             descriptor: None,
+            will_write: will_write.clone(),
+            readers: Pool::new(num_cpus::get(), || Reader::new(name, will_write.clone())),
+            writer: Arc::new(Mutex::new(Writer::new(name, will_write)))
         };
 
+        println!("Initializing bucket {} with path {:?}", bucket.name, bucket.path);
         if should_init {
             bucket.initialize(descriptor)?;
         } else {
@@ -169,12 +176,18 @@ impl Bucket {
         // Calculate new offset
         let new_offset = slice.len() as u64 + offset;
 
+        // Set the state to write, dissallow from reading
+        self.will_write.swap(true, Ordering::Acquire);
+
         // Write document
         self.file.write(&buf)?;
         self.set_offset(new_offset)?;
         let of = self.get_offset()?;
 
         // Todo: Implement indexing!
+
+        // Release the lock, allow writing access
+        self.will_write.swap(true, Ordering::Release);
 
         Ok(())
     }
@@ -185,5 +198,5 @@ impl Bucket {
     pub fn insert_into_index() {}
 }
 
-unsafe impl Send for Bucket {}
-unsafe impl Sync for Bucket {}
+unsafe impl<'a> Send for Bucket<'a> {}
+unsafe impl<'a> Sync for Bucket<'a> {}
