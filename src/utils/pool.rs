@@ -47,6 +47,10 @@ impl<'a, T> Ref<'a, T> {
         &self.data
     }
 
+    pub fn as_mut_ref(&mut self) -> &mut T {
+        &mut self.data
+    }
+
     unsafe fn take(&mut self) -> T {
         ManuallyDrop::take(&mut self.data)
     }

@@ -16,6 +16,7 @@ use bucket::descriptor::BucketDescription;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use fs2::*;
+use log::trace;
 
 pub mod bucket;
 pub mod descriptor;
@@ -28,7 +29,7 @@ use descriptor::DBDescriptor;
 static EXTENSION: &'static str = ".page";
 
 pub struct Database<'a, 'b> {
-    store_dir: &'b Path,                // Directory to store buckets
+    store_dir: &'b Path,                    // Directory to store buckets
     buckets: BTreeMap<&'a str, Bucket<'a>>, // BTree of in-use buckets
     descriptor: Option<DBDescriptor>,
 }
@@ -42,34 +43,30 @@ impl<'a, 'b> Database<'a, 'b> {
             descriptor: None,
         };
 
-        println!("Opening database");
-
         // Create the database directory if it doesn't exist
+        trace!("Checking if database already exists");
         if !db.store_dir.is_dir() {
             db.create_head_dir()?;
-            println!("Created head directory");
 
             // Create descriptor file and write to it
             let dynamic = DBDescriptor::dynamic();
             dynamic.save_to_path(&db.store_dir.join(&Path::new("database.desc")))?;
-            println!("Saved to path");
 
             // Assign descriptor
             db.descriptor = Some(dynamic);
         } else {
-            println!("Loading from path");
             db.descriptor = Some(DBDescriptor::load_from_path(
                 &db.store_dir.join(&Path::new("database.desc")),
             )?);
         }
 
-        println!("Finished loading database");
-
+        trace!("Successfully loaded and initialized a database");
         Ok(db)
     }
 
     /// Creates directory to hold buckets and database information
     pub fn create_head_dir(&self) -> std::io::Result<()> {
+        trace!("Creating head directory for database");
         Ok(fs::create_dir(self.store_dir)?)
     }
 
@@ -120,13 +117,18 @@ impl<'a, 'b> Database<'a, 'b> {
         Ok(Bucket::new(name, file, p, false, descriptor)?)
     }
 
+    /// Try to fetch a mutable reference to an internal bucket
+    pub fn borrow_bucket(&mut self, bucket: &'a str) -> Option<&mut Bucket<'a>> {
+        Some(self.buckets.get_mut(bucket)?)
+    }
+
     /// Inserts a new key and value into a bucket
     pub fn insert<T: DocumentConvert>(
         &mut self,
         bucket: &str,
         key: isize,
         value: T,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(usize, [u8; 24]), Box<dyn std::error::Error>> {
         let bucket = self.buckets.get_mut(bucket);
         let bucket = match bucket {
             Some(b) => b,
@@ -150,29 +152,44 @@ impl<'a, 'b> Database<'a, 'b> {
             }
         };
 
-        // Current solution loops through all fields, won't be very effiecent with a big amount of fields
-        // Todo: Fix, solution is very slow (maybe a hashmap?)
-        // Todo: (maybe generics to match it? Might not be able to in current rust versions)
-        for f in document.get_fields().iter() {
-            let mut found_f = false;
-            let p = bucket.descriptor.as_ref().unwrap().pull();
-            for is_f in p.as_ref().field_description.iter() {
-                if is_f.is_match(f) {
-                    found_f = true;
-                }
+        {
+            let p = bucket.descriptor.as_ref().as_ref().unwrap().pull();
+            let p = p.as_ref();
+            let field_description = &p.field_description;
+
+            if document.get_fields().len() < field_description.len() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "to few fields where defined in insert request",
+                )));
+            } else if document.get_fields().len() > field_description.len() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "to many fields where defined in insert request",
+                )));
             }
 
-            if !found_f {
-                return Err(Box::new(Error::new(
-                    ErrorKind::NotFound,
-                    "field does not exist",
-                )));
+            // Current solution loops through all fields, won't be very effiecent with a big amount of fields
+            // Todo: Fix, solution is very slow (maybe a hashmap?)
+            // Todo: (maybe generics to match it? Might not be able to in current rust versions)
+            for f in document.get_fields().iter() {
+                let mut found_f = false;
+                for is_f in field_description.iter() {
+                    if is_f.is_match(f) {
+                        found_f = true;
+                    }
+                }
+
+                if !found_f {
+                    return Err(Box::new(Error::new(
+                        ErrorKind::NotFound,
+                        "field does not exist",
+                    )));
+                }
             }
         }
 
-        bucket.insert(&document)?;
-
-        Ok(())
+        Ok(bucket.insert(&document)?)
     }
 
     pub fn find<T>(&self, bucket: &str, key: isize) -> std::io::Result<Vec<T>> {

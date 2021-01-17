@@ -8,6 +8,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fs2::FileExt;
+use log::trace;
 use serde::{Deserialize, Serialize};
 
 /// Extra head-room added on-top of the header size to allow for compatability with future versions
@@ -69,11 +70,14 @@ impl DBDescriptor {
         file.read_exact(&mut buf)?;
 
         let descriptor = DBDescriptor::deserialize(&buf)?;
+
+        trace!("Loaded database descriptor from database");
         Ok(descriptor)
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn Error>> {
         let mut file = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
+        trace!("Saving page size and header size to database");
 
         // Serialize the descriptor and write it
         let buf = self.serialize();

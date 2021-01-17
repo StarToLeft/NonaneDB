@@ -2,10 +2,13 @@
 #[macro_use]
 extern crate serde;
 
-pub mod db;
+#[macro_use]
+extern crate log;
+
+pub mod database;
 pub mod utils;
 
-use db::{
+use database::{
     bucket::{
         descriptor::BucketDescription,
         document::{
@@ -17,12 +20,15 @@ use db::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting test");
+    env_logger::init();
+
+    info!("Starting database and initializing buckets");
     let t = std::time::Instant::now();
     let mut db: Database = Database::open("./database")?;
     let el = t.elapsed();
-    println!("Open database {:?}", el);
+    debug!("It took {:?} to start the database", el);
 
+    info!("Initializing bucket");
     let t = std::time::Instant::now();
     let desc = BucketDescription {
         field_description: vec![
@@ -33,16 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     db.open_bucket("accounts", Some(desc))?;
     let el = t.elapsed();
-    println!("Open bucket {:?}", el);
+    debug!("It took {:?} to initialize 'accounts' bucket", el);
 
+    let elements = 1;
     let t = std::time::Instant::now();
-    db.insert::<Account>(
-        "accounts",
-        0,
-        Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se"),
-    )?;
+    for _ in 0..elements {
+        let _ = db.insert::<Account>(
+            "accounts",
+            0,
+            Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se"),
+        )?;
+    }
     let el = t.elapsed();
-    println!("Insert into bucket {:?}", el);
+    info!("Time taken for {} elements: {:?}, time for all: {:?}", elements, el / elements, el);
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     Ok(())
 }

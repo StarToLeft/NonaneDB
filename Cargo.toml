@@ -20,3 +20,8 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 parking_lot = "0.11"
 num_cpus = "1.13.0"
 page_size = "0.4.2"
+log = "0.4.13"
+rayon = "1.5.0"
+env_logger = "0.8.2"
+crossbeam-channel = "0.5.0"
+crossbeam-queue = "0.3.1"
