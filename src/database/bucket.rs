@@ -10,8 +10,8 @@ use std::{
     thread::{self, JoinHandle, Thread},
 };
 
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use crossbeam_queue::ArrayQueue;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fs2::*;
 use parking_lot::Mutex;
 use reader::Reader;
@@ -21,7 +21,13 @@ use descriptor::BucketDescription;
 
 use crate::utils::{self, pool::Pool};
 
-use self::{document::Document, writer::{Writer, queued::{QueuedWriteInformation, QueuedWriter, WriterThread}}};
+use self::{
+    document::Document,
+    writer::{
+        queued::{QueuedWriteInformation, QueuedWriter, WriterThread},
+        Writer,
+    },
+};
 
 pub mod descriptor;
 pub mod document;
@@ -34,6 +40,7 @@ pub mod writer;
 /// However, to store any data with meaning it's good to have it.
 static MIN_FREE_BYTES: u64 = 1_048_576; // A minimum of 1 MB of free space
 
+#[derive(Clone)]
 /// A bucket defines a datastructure, it contains a whole database within it
 pub struct Bucket<'a> {
     pub(crate) name: Arc<&'a str>,
@@ -55,7 +62,7 @@ impl<'a> Bucket<'a> {
         descriptor: Option<BucketDescription>,
     ) -> Result<Bucket<'a>, Box<dyn std::error::Error>> {
         let will_write = Arc::new(AtomicBool::new(false));
-        
+
         // Initialize multi-readers
         let readers = Pool::new(num_cpus::get(), || {
             Reader::new(name, &path.clone(), will_write.clone())
@@ -71,11 +78,25 @@ impl<'a> Bucket<'a> {
         ));
 
         // Initialize write queue
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let has_data: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let q: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(1000);
+        let q = Arc::new(q);
+
+        // Clones to be used within WriteThread struct to handle multi threaded writes
+        let q_cl = q.clone();
+        let should_exit_cl = should_exit.clone();
+
+        // Path for QueuedWriter to write at
+        let p = path.clone();
+
+        // Create the thread for writing for this bucket (and all clones of this bucket)
         let thread = thread::Builder::new()
             .name(name.into())
             .spawn(|| {
-                QueuedWriter::new(q)
+                let mut writer = QueuedWriter::new(p, q, should_exit);
+                writer.start(20);
+                writer
             })
             .unwrap();
 
@@ -89,7 +110,9 @@ impl<'a> Bucket<'a> {
             will_write,
             writer_thread: WriterThread {
                 join_handle: Arc::new(thread),
-            }
+                should_exit: should_exit_cl,
+                q: q_cl,
+            },
         };
 
         trace!(
@@ -140,10 +163,10 @@ impl<'a> Bucket<'a> {
     /// Must be called before writing to a file as it will otherwise affect performance for reads
     /// writes without calling this might error other reads
     pub fn toggle_writer(&mut self) {
-        if self.will_write.load(Ordering::Relaxed) {
-            self.will_write.swap(true, Ordering::Relaxed);
+        if self.will_write.load(Ordering::SeqCst) {
+            self.will_write.swap(true, Ordering::SeqCst);
         } else {
-            self.will_write.swap(false, Ordering::Relaxed);
+            self.will_write.swap(false, Ordering::SeqCst);
         }
     }
 
@@ -211,8 +234,18 @@ impl<'a> Bucket<'a> {
     ) -> Result<(usize, [u8; 24]), Box<dyn std::error::Error>> {
         let offset = self.readers.pull().as_mut_ref().get_offset()?;
 
-        // Serialize documentappend
-        let mut buf = document.serialize()?;
+        // Buffer to be written to disk
+        let mut buf = Vec::new();
+        
+        // Serialize document
+        let mut serialized_data = document.serialize()?;
+
+        // Add length of document to ease reading
+        let mut len = Vec::new();
+        len.write_u64::<LittleEndian>(serialized_data.len() as u64)?;
+
+        buf.append(&mut len);
+        buf.append(&mut serialized_data);
         // Todo: Change to constant across whole DB
         let len = utils::numbers::round_to_multiple(buf.len(), 8);
         buf.resize(len, 0);
@@ -227,17 +260,42 @@ impl<'a> Bucket<'a> {
         self.toggle_writer();
         {
             // Fetch the writer
-            let mut wrt = self.writer.lock();
-            let file = wrt.borrow_file();
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_u64::<LittleEndian>(buf.len() as u64)?;
+            self.toggle_writer();
+            {
+                let mut wrt = self.writer.lock();
+                let file = wrt.borrow_file();
+                file.seek(SeekFrom::Start(offset))?;
+                wrt.set_offset(new_offset)?;
+            }
+            self.toggle_writer();
 
-            // Write document
-            file.write(&buf)?;
-            wrt.set_offset(new_offset)?;
+            // Set up queued write object
+            let info = QueuedWriteInformation {
+                seek: (offset, new_offset),
+                len: buf.len(),
+                bytes: buf,
+            };
+
+            // Push it to the queue or default to locked mutex writing if it fails
+            // (not very effiecent, however exceeding X amount of inserts per second might be a problem, time to add a new cluster)
+            // Or I guess, if you're cool, add more ram
+            let res = self.writer_thread.q.push(info);
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    self.toggle_writer();
+                    {
+                        trace!("Had to self-write data for document");
+                        let mut wrt = self.writer.lock();
+                        let file = wrt.borrow_file();
+                        file.seek(SeekFrom::Start(offset))?;
+                        file.write(&e.bytes)?;
+                    }
+                    self.toggle_writer();
+                }
+            }
 
             // Todo: Implement indexing!
-
             // Todo: Handle events with file.sync_all()
         }
         self.toggle_writer();
@@ -245,17 +303,15 @@ impl<'a> Bucket<'a> {
         Ok((new_offset as usize, [0; 24]))
     }
 
-    /// Initializes a new index for a field
-    pub fn create_index() {}
+    pub fn count_documents(&mut self) -> usize {
+        let mut count = 0;
 
-    pub fn insert_into_index() {}
-}
+        // Borrow a reader
+        let mut reader = self.readers.pull();
+        let reader = reader.as_mut_ref();
+        let file = reader.borrow_file();
 
-impl<'a> Clone for Bucket<'a> {
-    fn clone(&self) -> Self {
-        unsafe {
-            std::mem::transmute_copy(self)
-        }
+        return count;
     }
 }
 

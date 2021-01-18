@@ -5,6 +5,8 @@ extern crate serde;
 #[macro_use]
 extern crate log;
 
+use rayon::prelude::*;
+
 pub mod database;
 pub mod utils;
 
@@ -37,23 +39,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             FieldDescriptor::new("email".into(), FieldType::Text),
         ],
     };
-    db.open_bucket("accounts", Some(desc))?;
+    db.open_bucket("accounts", Some(desc.clone()))?;
     let el = t.elapsed();
     debug!("It took {:?} to initialize 'accounts' bucket", el);
 
-    let elements = 1;
-    let t = std::time::Instant::now();
-    for _ in 0..elements {
-        let _ = db.insert::<Account>(
-            "accounts",
-            0,
-            Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se"),
-        )?;
-    }
-    let el = t.elapsed();
-    info!("Time taken for {} elements: {:?}, time for all: {:?}", elements, el / elements, el);
+    (0..16).into_par_iter().for_each(|_| {
+        let mut database = db.clone();
+        let elements = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..elements {
+            let _ = database.insert::<Account>(
+                "accounts",
+                0,
+                Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se"),
+            );
+        }
+        let el = t.elapsed();
+        info!(
+            "Time taken for each of {} elements: {:?}, time for all: {:?}",
+            elements,
+            el / elements,
+            el
+        );
+    });
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(40));
 
     Ok(())
 }

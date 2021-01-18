@@ -15,6 +15,7 @@ use std::{fs::OpenOptions, io::prelude::*};
 use bucket::descriptor::BucketDescription;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
+use dashmap::{DashMap, mapref::one::RefMut};
 use fs2::*;
 use log::trace;
 
@@ -28,19 +29,20 @@ use descriptor::DBDescriptor;
 /// Extension used for buckets
 static EXTENSION: &'static str = ".page";
 
+#[derive(Clone)]
 pub struct Database<'a, 'b> {
-    store_dir: &'b Path,                    // Directory to store buckets
-    buckets: BTreeMap<&'a str, Bucket<'a>>, // BTree of in-use buckets
-    descriptor: Option<DBDescriptor>,
+    store_dir: Arc<&'b Path>,              // Directory to store buckets
+    buckets: DashMap<&'a str, Bucket<'a>>, // BTree of in-use buckets
+    descriptor: Arc<Option<DBDescriptor>>,
 }
 
 impl<'a, 'b> Database<'a, 'b> {
     pub fn open(path: &'b str) -> Result<Database<'a, 'b>, Box<dyn std::error::Error>> {
         // Initialize database struct
         let mut db = Database {
-            store_dir: &Path::new(path),
-            buckets: BTreeMap::new(),
-            descriptor: None,
+            store_dir: Arc::new(&Path::new(path)),
+            buckets: DashMap::new(),
+            descriptor: Arc::new(None),
         };
 
         // Create the database directory if it doesn't exist
@@ -53,11 +55,11 @@ impl<'a, 'b> Database<'a, 'b> {
             dynamic.save_to_path(&db.store_dir.join(&Path::new("database.desc")))?;
 
             // Assign descriptor
-            db.descriptor = Some(dynamic);
+            db.descriptor = Arc::new(Some(dynamic));
         } else {
-            db.descriptor = Some(DBDescriptor::load_from_path(
+            db.descriptor = Arc::new(Some(DBDescriptor::load_from_path(
                 &db.store_dir.join(&Path::new("database.desc")),
-            )?);
+            )?));
         }
 
         trace!("Successfully loaded and initialized a database");
@@ -67,7 +69,7 @@ impl<'a, 'b> Database<'a, 'b> {
     /// Creates directory to hold buckets and database information
     pub fn create_head_dir(&self) -> std::io::Result<()> {
         trace!("Creating head directory for database");
-        Ok(fs::create_dir(self.store_dir)?)
+        Ok(fs::create_dir(self.store_dir.as_ref())?)
     }
 
     pub fn open_bucket(
@@ -118,8 +120,8 @@ impl<'a, 'b> Database<'a, 'b> {
     }
 
     /// Try to fetch a mutable reference to an internal bucket
-    pub fn borrow_bucket(&mut self, bucket: &'a str) -> Option<&mut Bucket<'a>> {
-        Some(self.buckets.get_mut(bucket)?)
+    pub fn borrow_buckets(&mut self, bucket: &'a str) -> DashMap<&'a str, Bucket<'a>> {
+        self.buckets.clone()
     }
 
     /// Inserts a new key and value into a bucket
@@ -130,7 +132,7 @@ impl<'a, 'b> Database<'a, 'b> {
         value: T,
     ) -> Result<(usize, [u8; 24]), Box<dyn std::error::Error>> {
         let bucket = self.buckets.get_mut(bucket);
-        let bucket = match bucket {
+        let mut bucket = match bucket {
             Some(b) => b,
             None => {
                 return Err(Box::new(Error::new(
