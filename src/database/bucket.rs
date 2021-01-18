@@ -80,7 +80,7 @@ impl<'a> Bucket<'a> {
         // Initialize write queue
         let should_exit = Arc::new(AtomicBool::new(false));
         let has_data: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let q: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(1000);
+        let q: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(10000);
         let q = Arc::new(q);
 
         // Clones to be used within WriteThread struct to handle multi threaded writes
@@ -304,7 +304,7 @@ impl<'a> Bucket<'a> {
     }
 
     pub fn count_documents(&mut self) -> usize {
-        let mut count = 0;
+        let count = 0;
 
         // Borrow a reader
         let mut reader = self.readers.pull();

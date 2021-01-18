@@ -43,9 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let el = t.elapsed();
     debug!("It took {:?} to initialize 'accounts' bucket", el);
 
-    (0..16).into_par_iter().for_each(|_| {
+    (0..4).into_par_iter().for_each(|_| {
         let mut database = db.clone();
-        let elements = 2000;
+        let elements = 10;
         let t = std::time::Instant::now();
         for _ in 0..elements {
             let _ = database.insert::<Account>(
@@ -64,7 +64,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     std::thread::sleep(std::time::Duration::from_secs(40));
-
     Ok(())
 }
 
