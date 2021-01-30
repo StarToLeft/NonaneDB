@@ -4,7 +4,7 @@ use std::{
     io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread::{self, JoinHandle, Thread},
@@ -47,9 +47,10 @@ pub struct Bucket<'a> {
     pub(crate) path: Arc<PathBuf>,
     pub(crate) descriptor: Arc<Option<Pool<BucketDescription>>>,
     pub(crate) will_write: Arc<AtomicBool>,
-    pub(crate) readers: Arc<Pool<Reader<'a>>>,
+    pub(crate) readers: Option<Arc<Pool<Reader<'a>>>>,
     pub(crate) writer: Arc<Mutex<Writer<'a>>>,
-    pub(crate) writer_thread: WriterThread,
+    pub(crate) writer_thread: Option<WriterThread>,
+    pub(crate) atomic_offset: Arc<AtomicUsize>,
 }
 
 impl<'a> Bucket<'a> {
@@ -63,15 +64,7 @@ impl<'a> Bucket<'a> {
     ) -> Result<Bucket<'a>, Box<dyn std::error::Error>> {
         let will_write = Arc::new(AtomicBool::new(false));
 
-        // Initialize multi-readers
-        let readers = Pool::new(num_cpus::get(), || {
-            Reader::new(name, &path.clone(), will_write.clone())
-                .expect("Failed to initialize reader for pool")
-        });
-
         // Initialize single writer
-        // Todo: Add QueuedWriter for multi-threaded writing
-        // Todo: Will optimize by combining bytes to be written into a big insert instead of a lot of small ones
         let writer = Arc::new(Mutex::new(
             Writer::new(name, &path.clone(), will_write.clone())
                 .expect("Failed to initialize writer for bucket"),
@@ -80,50 +73,76 @@ impl<'a> Bucket<'a> {
         // Initialize write queue
         let should_exit = Arc::new(AtomicBool::new(false));
         let has_data: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let q: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(10000);
-        let q = Arc::new(q);
+        let write_queue: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(10000);
+        let write_queue = Arc::new(write_queue);
 
         // Clones to be used within WriteThread struct to handle multi threaded writes
-        let q_cl = q.clone();
+        let write_queue_cl = write_queue.clone();
         let should_exit_cl = should_exit.clone();
 
         // Path for QueuedWriter to write at
         let p = path.clone();
-
-        // Create the thread for writing for this bucket (and all clones of this bucket)
-        let thread = thread::Builder::new()
-            .name(name.into())
-            .spawn(|| {
-                let mut writer = QueuedWriter::new(p, q, should_exit);
-                writer.start(20);
-                writer
-            })
-            .unwrap();
 
         // Create bucket
         let mut bucket = Self {
             name: Arc::new(name),
             path: Arc::new(path.clone()),
             descriptor: Arc::new(None),
-            readers: Arc::new(readers),
+            readers: None,
             writer,
-            will_write,
-            writer_thread: WriterThread {
-                join_handle: Arc::new(thread),
-                should_exit: should_exit_cl,
-                q: q_cl,
-            },
+            will_write: will_write.clone(),
+            writer_thread: None,
+            atomic_offset: Arc::new(AtomicUsize::new(0)),
         };
 
         trace!(
             "Initializing and opening readers and writer for bucket {}",
             bucket.name
         );
+
+        // Initialize and load bucket
         if should_init {
             bucket.initialize(descriptor)?;
         } else {
             bucket.load_page()?;
         }
+
+        // Temporary reader to read initial offset
+        let mut reader = Reader::new(name, &path.clone(), will_write.clone(), None)
+            .expect("Failed to initialize reader for pool");
+        let offset = reader.get_offset()? as usize;
+        bucket.atomic_offset = Arc::new(AtomicUsize::new(offset));
+
+        // Create the thread for writing for this bucket (and all clones of this bucket)
+        let thread = thread::Builder::new()
+            .name(name.into())
+            .spawn(|| {
+                let mut writer = QueuedWriter::new(p, write_queue, should_exit);
+                writer.start(20);
+                writer
+            })
+            .unwrap();
+
+        // Assign thread data
+        bucket.writer_thread = Some(WriterThread {
+            join_handle: Arc::new(thread),
+            should_exit: should_exit_cl,
+            q: write_queue_cl,
+        });
+
+        // Initialize multi-readers
+        let readers = Pool::new(num_cpus::get(), || {
+            Reader::new(
+                name,
+                &path.clone(),
+                will_write.clone(),
+                Some(bucket.atomic_offset.clone()),
+            )
+            .expect("Failed to initialize reader for pool")
+        });
+
+        // Assign readers
+        bucket.readers = Some(Arc::new(readers));
 
         Ok(bucket)
     }
@@ -178,7 +197,7 @@ impl<'a> Bucket<'a> {
     ///
     /// `Rows` are written below this
     pub fn initialize_page(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // self.file.as_ref().seek(SeekFrom::Start(0))?;
+        trace!("Initializing initial page for bucket {}", self.name);
 
         // Writes the descriptor to disk (WARN: Takes up a whol page)
         let buf;
@@ -211,11 +230,12 @@ impl<'a> Bucket<'a> {
 
     /// Load an already existing page from a bucket
     pub fn load_page(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut reader = self.readers.pull();
-        let reader = reader.as_mut_ref();
+        // Create a temporary reader
+        let mut reader = Reader::new(&self.name, &self.path, self.will_write.clone(), None)?;
         let mut file = reader.borrow_file();
         file.seek(SeekFrom::Start(0))?;
 
+        // Read the descriptor length and then the bucket descriptor
         let len = file.read_u16::<LittleEndian>()?;
         let mut buf = Vec::with_capacity(len.into());
         unsafe { buf.set_len(len.into()) };
@@ -232,11 +252,17 @@ impl<'a> Bucket<'a> {
         &mut self,
         document: &Document,
     ) -> Result<(usize, [u8; 24]), Box<dyn std::error::Error>> {
-        let offset = self.readers.pull().as_mut_ref().get_offset()?;
+        let offset = self
+            .readers
+            .as_ref()
+            .unwrap()
+            .pull()
+            .as_mut_ref()
+            .get_offset()?;
 
         // Buffer to be written to disk
         let mut buf = Vec::new();
-        
+
         // Serialize document
         let mut serialized_data = document.serialize()?;
 
@@ -254,64 +280,64 @@ impl<'a> Bucket<'a> {
         // Calculate new offset
         let new_offset = slice.len() as u64 + offset + std::mem::size_of::<u64>() as u64;
 
-        // Toggle the writer
         // Todo: Replace Try (?) with match to handle writing errors
         // ! Not a big issue right now, but eventually it will become one 🚀
-        self.toggle_writer();
-        {
-            // Fetch the writer
-            self.toggle_writer();
-            {
-                let mut wrt = self.writer.lock();
-                let file = wrt.borrow_file();
-                file.seek(SeekFrom::Start(offset))?;
-                wrt.set_offset(new_offset)?;
+        self.atomic_offset
+            .store(new_offset.try_into().unwrap(), Ordering::SeqCst);
+
+        // Set up queued write object
+        let info = QueuedWriteInformation {
+            seek: (offset, new_offset),
+            len: buf.len(),
+            bytes: buf,
+        };
+
+        // Push it to the queue or error if it's full
+        // (not very effiecent, however exceeding X amount of inserts per second might be a problem, time to add a new cluster)
+        // Or I guess, if you're cool, add more ram
+        let wrt_thrd = self.writer_thread.as_ref().unwrap();
+        let res = wrt_thrd.q.push(info);
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Box::new(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "Out of queue space",
+                )));
             }
-            self.toggle_writer();
-
-            // Set up queued write object
-            let info = QueuedWriteInformation {
-                seek: (offset, new_offset),
-                len: buf.len(),
-                bytes: buf,
-            };
-
-            // Push it to the queue or default to locked mutex writing if it fails
-            // (not very effiecent, however exceeding X amount of inserts per second might be a problem, time to add a new cluster)
-            // Or I guess, if you're cool, add more ram
-            let res = self.writer_thread.q.push(info);
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    self.toggle_writer();
-                    {
-                        trace!("Had to self-write data for document");
-                        let mut wrt = self.writer.lock();
-                        let file = wrt.borrow_file();
-                        file.seek(SeekFrom::Start(offset))?;
-                        file.write(&e.bytes)?;
-                    }
-                    self.toggle_writer();
-                }
-            }
-
-            // Todo: Implement indexing!
-            // Todo: Handle events with file.sync_all()
         }
-        self.toggle_writer();
 
+        // Todo: Implement indexing!
+        // Todo: Handle events with file.sync_all()
         Ok((new_offset as usize, [0; 24]))
     }
 
-    pub fn count_documents(&mut self) -> usize {
-        let count = 0;
+    pub fn count_documents(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut count = 0;
 
         // Borrow a reader
-        let mut reader = self.readers.pull();
+        let mut reader = self.readers.as_ref().unwrap().pull();
         let reader = reader.as_mut_ref();
-        let file = reader.borrow_file();
+        let mut file = reader.borrow_file();
 
-        return count;
+        let mut offset = page_size::get() as u64;
+        loop {
+            file.seek(SeekFrom::Start(offset))?;
+            let size = file.read_u64::<LittleEndian>();
+            let mut size = match size {
+                Ok(s) => s,
+                Err(_) => {
+                    break;
+                }
+            };
+
+            size += std::mem::size_of::<u64>() as u64;
+            offset = size;
+
+            count += 1;
+        }
+
+        return Ok(count);
     }
 }
 

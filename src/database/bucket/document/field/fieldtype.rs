@@ -82,6 +82,38 @@ impl<'a> ConvertFieldType<'a, &Vec<u8>> for &Vec<u8> {
     }
 }
 
+impl<'a> ConvertFieldType<'a, Vec<u8>> for Vec<u8> {
+    type Output = &'a [u8];
+
+    fn get_type(&self) -> FieldType {
+        FieldType::Bytes
+    }
+
+    fn serialize(&self) -> Option<Vec<u8>> {
+        Some(self.to_vec())
+    }
+
+    fn deserialize(d: &'a Vec<u8>) -> Option<Self::Output> {
+        Some(&d)
+    }
+}
+
+impl<'a> ConvertFieldType<'a, &'a [u8]> for &Vec<u8> {
+    type Output = Vec<u8>;
+
+    fn get_type(&self) -> FieldType {
+        FieldType::Bytes
+    }
+
+    fn serialize(&self) -> Option<Vec<u8>> {
+        Some(self.to_vec())
+    }
+
+    fn deserialize(d: &'a Vec<u8>) -> Option<Self::Output> {
+        Some(Vec::from(d.as_slice()))
+    }
+}
+
 impl<'a> ConvertFieldType<'a, &'a str> for &str {
     type Output = &'a str;
 

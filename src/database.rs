@@ -213,4 +213,14 @@ impl<'a, 'b> Database<'a, 'b> {
 
         Ok(Vec::new())
     }
+
+    pub fn get_mut_bucket(&'a mut self, bucket: &'a str) -> std::io::Result<RefMut<&'a str, Bucket>> {
+        let bucket = self.buckets.get_mut(bucket);
+        let bucket = match bucket {
+            Some(b) => b,
+            None => return Err(Error::new(ErrorKind::NotFound, "bucket was not found")),
+        };
+
+        Ok(bucket)
+    }
 }

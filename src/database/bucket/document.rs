@@ -41,6 +41,6 @@ impl Document {
 pub trait DocumentConvert {
     type ConvertFrom;
 
-    fn convert_to(&self) -> Option<Document>;
+    fn convert_to(self) -> Option<Document>;
     fn convert_from(doc: &Document) -> Option<Self::ConvertFrom>;
 }

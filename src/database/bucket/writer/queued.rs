@@ -1,15 +1,9 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
-    mem::MaybeUninit,
-    path::{Path, PathBuf},
-    sync::{
+use std::{convert::TryInto, fs::{File, OpenOptions}, io::{Seek, SeekFrom, Write}, mem::MaybeUninit, path::{Path, PathBuf}, sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
-    },
-    thread::JoinHandle,
-};
+    }, thread::JoinHandle};
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use crossbeam_queue::ArrayQueue;
 use log::trace;
 use parking_lot::Mutex;
@@ -32,6 +26,9 @@ pub struct QueuedWriteInformation {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// A threaded writer which chunks for faster writing
+///
+/// Chunks together multiple sequential buffers into one bigger buffer
 pub struct QueuedWriter {
     pub(crate) q: Arc<ArrayQueue<QueuedWriteInformation>>,
     pub(crate) file: File,
@@ -57,6 +54,8 @@ impl QueuedWriter {
     }
 
     /// Initializes and starts the writer
+    ///
+    /// Prepares it for writing
     pub fn start(&mut self, sleep_ns: u64) {
         // Todo: Implement some type of system to skip the while loop, as it's a big resource hog (works really well though)
         while !self.should_exit.as_ref().load(Ordering::SeqCst) {
@@ -75,6 +74,8 @@ impl QueuedWriter {
                     }
                 };
             }
+
+            // Check data length and sort by key to chunk
             if data.len() == 0 {
                 continue;
             } else {
@@ -129,10 +130,23 @@ impl QueuedWriter {
         }
     }
 
+    /// Store chunks to disk
     fn write_chunk(&mut self, chunk: &(u64, Vec<u8>)) -> Result<(), Box<dyn std::error::Error>> {
         let t = std::time::Instant::now();
         self.file.seek(SeekFrom::Start(chunk.0))?;
         self.file.write(&chunk.1)?;
+
+        let location: u64 = (page_size::get() - std::mem::size_of::<u64>() * 2)
+            .try_into()
+            .unwrap();
+
+        // Write the offset to disk
+        // ! This does not work with multiple QueuedWriters as it does not keep track if the offset is 
+        // ! larger than the old offset or not
+        let offset = chunk.0 + chunk.1.len() as u64;
+        self.file.seek(SeekFrom::Start(location))?;
+        self.file.write_u64::<LittleEndian>(offset)?;
+
         let el = t.elapsed();
         trace!("Wrote chunks {:?} to disk with seek {}", el, chunk.0);
         Ok(())
