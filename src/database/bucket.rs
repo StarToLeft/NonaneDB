@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     convert::TryInto,
     fs::File,
     io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -33,12 +34,15 @@ pub mod descriptor;
 pub mod document;
 pub mod reader;
 pub mod writer;
+pub mod config;
 
 /// A minimum set of space required to initialize a bucket
 ///
 /// The database does not need this much space to initialize a bucket.
 /// However, to store any data with meaning it's good to have it.
 static MIN_FREE_BYTES: u64 = 1_048_576; // A minimum of 1 MB of free space
+
+static MAX_ITEMS_IN_QUEUE: usize = 50000;
 
 #[derive(Clone)]
 /// A bucket defines a datastructure, it contains a whole database within it
@@ -73,7 +77,7 @@ impl<'a> Bucket<'a> {
         // Initialize write queue
         let should_exit = Arc::new(AtomicBool::new(false));
         let has_data: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let write_queue: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(10000);
+        let write_queue: ArrayQueue<QueuedWriteInformation> = ArrayQueue::new(MAX_ITEMS_IN_QUEUE);
         let write_queue = Arc::new(write_queue);
 
         // Clones to be used within WriteThread struct to handle multi threaded writes
@@ -114,21 +118,23 @@ impl<'a> Bucket<'a> {
         bucket.atomic_offset = Arc::new(AtomicUsize::new(offset));
 
         // Create the thread for writing for this bucket (and all clones of this bucket)
+        let (sender, receiver) = std::sync::mpsc::channel();
         let thread = thread::Builder::new()
             .name(name.into())
-            .spawn(|| {
+            .spawn(move || {
                 let mut writer = QueuedWriter::new(p, write_queue, should_exit);
-                writer.start(20);
-                writer
+                let _ = sender.send(writer.1);
+                writer.0.start(100_000_000);
+                writer.0
             })
             .unwrap();
 
+        // Recieve Writer and assign it
+        let mut writer_thread = receiver.recv()?;
+        writer_thread.join_handle = Some(Arc::new(thread));
+
         // Assign thread data
-        bucket.writer_thread = Some(WriterThread {
-            join_handle: Arc::new(thread),
-            should_exit: should_exit_cl,
-            q: write_queue_cl,
-        });
+        bucket.writer_thread = Some(writer_thread);
 
         // Initialize multi-readers
         let readers = Pool::new(num_cpus::get(), || {
@@ -247,6 +253,10 @@ impl<'a> Bucket<'a> {
         Ok(())
     }
 
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+
     /// Insert a document into the store
     pub fn insert(
         &mut self,
@@ -260,25 +270,29 @@ impl<'a> Bucket<'a> {
             .as_mut_ref()
             .get_offset()?;
 
-        // Buffer to be written to disk
-        let mut buf = Vec::new();
-
         // Serialize document
-        let mut serialized_data = document.serialize()?;
+        let mut data = document.serialize()?;
+
+        // Todo: Change to constant across whole DB
+        let additional_bytes = std::mem::size_of::<u64>();
+        let len = utils::numbers::round_to_multiple(data.len(), 8);
+        data.resize(len, 0);
+
+        // Add length infront
+        let mut buf = Vec::new();
 
         // Add length of document to ease reading
         let mut len = Vec::new();
-        len.write_u64::<LittleEndian>(serialized_data.len() as u64)?;
-
+        len.write_u64::<LittleEndian>((data.len() + std::mem::size_of::<u64>()) as u64)?;
         buf.append(&mut len);
-        buf.append(&mut serialized_data);
-        // Todo: Change to constant across whole DB
-        let len = utils::numbers::round_to_multiple(buf.len(), 8);
-        buf.resize(len, 0);
+
+        // Finally move the serialized data to the buffer
+        buf.append(&mut data);
+
         let slice = buf.as_slice();
 
         // Calculate new offset
-        let new_offset = slice.len() as u64 + offset + std::mem::size_of::<u64>() as u64;
+        let new_offset = offset + slice.len() as u64;
 
         // Todo: Replace Try (?) with match to handle writing errors
         // ! Not a big issue right now, but eventually it will become one 🚀
@@ -323,17 +337,16 @@ impl<'a> Bucket<'a> {
         let mut offset = page_size::get() as u64;
         loop {
             file.seek(SeekFrom::Start(offset))?;
+
             let size = file.read_u64::<LittleEndian>();
-            let mut size = match size {
+            let size = match size {
                 Ok(s) => s,
                 Err(_) => {
                     break;
                 }
             };
 
-            size += std::mem::size_of::<u64>() as u64;
-            offset = size;
-
+            offset += size as u64;
             count += 1;
         }
 

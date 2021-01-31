@@ -119,8 +119,7 @@ impl<'a, 'b> Database<'a, 'b> {
         Ok(Bucket::new(name, file, p, false, descriptor)?)
     }
 
-    /// Try to fetch a mutable reference to an internal bucket
-    pub fn borrow_buckets(&mut self, bucket: &'a str) -> DashMap<&'a str, Bucket<'a>> {
+    pub fn borrow_buckets(&mut self) -> DashMap<&'a str, Bucket<'a>> {
         self.buckets.clone()
     }
 
@@ -214,7 +213,7 @@ impl<'a, 'b> Database<'a, 'b> {
         Ok(Vec::new())
     }
 
-    pub fn get_mut_bucket(&'a mut self, bucket: &'a str) -> std::io::Result<RefMut<&'a str, Bucket>> {
+    pub fn get_mut_bucket(&'a mut self, bucket: &str) -> std::io::Result<RefMut<&'a str, Bucket>> {
         let bucket = self.buckets.get_mut(bucket);
         let bucket = match bucket {
             Some(b) => b,

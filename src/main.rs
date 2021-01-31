@@ -8,6 +8,8 @@ extern crate log;
 pub mod database;
 pub mod utils;
 
+use std::{sync::atomic::Ordering, time::Duration};
+
 use database::{
     bucket::{
         descriptor::BucketDescription,
@@ -44,46 +46,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let el = t.elapsed();
     debug!("It took {:?} to initialize 'accounts' bucket", el);
 
+    let mut dbe = db.clone();
+    let mut buck = dbe.get_mut_bucket("accounts")?;
+    let count = buck.count_documents()?;
+
+    info!(
+        "Initially counted {} documents in bucket {}",
+        count,
+        buck.get_name()
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(16)
         .build()
         .unwrap();
 
-    for _ in 0..100 {
+    let installations = 100;
+
+    let insert_time = std::time::Instant::now();
+    for _ in 0..installations {
         let database = db.clone();
-        pool.install(move || insert(database, 100));
+        pool.install(move || insert(database, 10000));
     }
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Wait for thread writing to finish
+    {
+        let mut dbx = db.clone();
+        let bucks = dbx.borrow_buckets();
+        let buck = bucks.get_mut("accounts");
+        let buck = buck.as_ref();
+        let buck = buck.unwrap();
+        let writer_thread = buck.writer_thread.clone().unwrap();
 
+        while writer_thread.items.load(Ordering::SeqCst) > 0 {}
+    }
+
+    let el = insert_time.elapsed();
+
+    // Count the new documents
     let mut buck = db.get_mut_bucket("accounts")?;
     let c = buck.count_documents()?;
 
-    println!("{}", c);
+    info!(
+        "Counted {} documents in bucket {}, Last count: {}",
+        c,
+        buck.get_name(),
+        count
+    );
+
+    info!(
+        "Test: Insert time for {} elements was counted to: {:?}",
+        c - count,
+        el
+    );
 
     Ok(())
 }
 
 pub fn insert(mut database: Database, el: i32) {
     let mut data = Vec::new();
-    for _ in 0..8
-    {
+    for _ in 0..1_048_576 {
         data.push(0);
     }
 
     for _ in 0..el {
         let d = data.clone();
-        let t = std::time::Instant::now();
         let r = database.insert::<Account>(
             "accounts",
             0,
             Account::new("Anton", "Hagsér", "anton.hagser@epsidel.se", d),
         );
+
         if r.is_err() {
             debug!("{:?}", r);
         }
-        let el = t.elapsed();
-        info!("Time taken for element: {:?}", el);
     }
 }
 

@@ -1,7 +1,4 @@
-use std::{convert::TryInto, fs::{File, OpenOptions}, io::{Seek, SeekFrom, Write}, mem::MaybeUninit, path::{Path, PathBuf}, sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    }, thread::JoinHandle};
+use std::{convert::TryInto, fs::{File, OpenOptions}, io::{Seek, SeekFrom, Write}, mem::MaybeUninit, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}, thread::JoinHandle};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use crossbeam_queue::ArrayQueue;
@@ -13,10 +10,12 @@ use crate::utils::threading::BooleanSemaphore;
 // Information about the writer thread
 #[derive(Debug, Clone)]
 pub struct WriterThread {
-    pub(crate) join_handle: Arc<JoinHandle<QueuedWriter>>,
+    pub(crate) join_handle: Option<Arc<JoinHandle<QueuedWriter>>>,
     pub(crate) should_exit: Arc<AtomicBool>,
     pub(crate) q: Arc<ArrayQueue<QueuedWriteInformation>>,
-}
+
+    // Debugging
+    pub(crate) items: Arc<AtomicUsize>,}
 
 /// Data used to describe where the data will be written to
 #[derive(Debug, Clone)]
@@ -33,6 +32,9 @@ pub struct QueuedWriter {
     pub(crate) q: Arc<ArrayQueue<QueuedWriteInformation>>,
     pub(crate) file: File,
     pub(crate) should_exit: Arc<AtomicBool>,
+
+    // Debugging
+    pub(crate) items: Arc<AtomicUsize>,
 }
 
 impl QueuedWriter {
@@ -41,16 +43,29 @@ impl QueuedWriter {
         path: PathBuf,
         q: Arc<ArrayQueue<QueuedWriteInformation>>,
         should_exit: Arc<AtomicBool>,
-    ) -> QueuedWriter {
+    ) -> (QueuedWriter, WriterThread) {
         let file = OpenOptions::new()
             .write(true)
             .open(&path)
             .expect("Failed to open writer thread");
-        QueuedWriter {
-            q,
-            file,
-            should_exit,
-        }
+
+        let items = Arc::new(AtomicUsize::new(0));
+
+        (
+            QueuedWriter {
+                q: q.clone(),
+                file,
+                should_exit: should_exit.clone(),
+                items: items.clone(),
+            },
+
+            WriterThread {
+                join_handle: None,
+                should_exit,
+                q,
+                items,
+            }
+        )
     }
 
     /// Initializes and starts the writer
@@ -58,7 +73,7 @@ impl QueuedWriter {
     /// Prepares it for writing
     pub fn start(&mut self, sleep_ns: u64) {
         // Todo: Implement some type of system to skip the while loop, as it's a big resource hog (works really well though)
-        while !self.should_exit.as_ref().load(Ordering::SeqCst) {
+        while !self.should_exit.as_ref().load(Ordering::SeqCst) || self.q.len() > 0 {
             std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
             let t = std::time::Instant::now();
             let l = self.q.len().max(25);
@@ -70,6 +85,7 @@ impl QueuedWriter {
                         data.push((el.seek, el));
                     }
                     None => {
+                        self.items.store(0, Ordering::SeqCst);
                         continue;
                     }
                 };
@@ -77,6 +93,7 @@ impl QueuedWriter {
 
             // Check data length and sort by key to chunk
             if data.len() == 0 {
+                self.items.store(0, Ordering::SeqCst);
                 continue;
             } else {
                 data.sort_unstable_by_key(|x| x.0);
@@ -121,6 +138,8 @@ impl QueuedWriter {
                 }
             }
 
+            self.items.store(amount_chunked, Ordering::SeqCst);
+
             let el = t.elapsed();
             trace!(
                 "Writes that where chunked: {} | Time to chunk: {:?}",
@@ -148,7 +167,7 @@ impl QueuedWriter {
         self.file.write_u64::<LittleEndian>(offset)?;
 
         let el = t.elapsed();
-        trace!("Wrote chunks {:?} to disk with seek {}", el, chunk.0);
+        trace!("Wrote chunks {:?} to disk with seek {} and length {}", el, chunk.0, chunk.1.len());
         Ok(())
     }
 }
